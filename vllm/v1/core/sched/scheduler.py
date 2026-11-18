@@ -347,6 +347,7 @@ class Scheduler(SchedulerInterface):
             self._re_block_ids: dict[str, list[int]] = {}
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+        self.enable_sd = speculative_config is not None
 
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
@@ -358,6 +359,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        spec_decode_enabled: bool = True,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
@@ -381,7 +383,7 @@ class Scheduler(SchedulerInterface):
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle:
+        if self.use_eagle and spec_decode_enabled:
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
@@ -424,6 +426,7 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        spec_decode_enabled = self.enable_sd
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -470,6 +473,8 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            if not spec_decode_enabled and request.spec_token_ids:
+                request.spec_token_ids = []
 
             if (
                 request.num_output_placeholders > 0
@@ -500,7 +505,11 @@ class Scheduler(SchedulerInterface):
                 continue
 
             num_new_tokens = (
-                request.num_tokens_with_spec
+                (
+                    request.num_tokens_with_spec
+                    if spec_decode_enabled
+                    else request.num_tokens
+                )
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
@@ -532,7 +541,9 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
+                    shift_computed_tokens=(
+                        1 if self.use_eagle and spec_decode_enabled else 0
+                    ),
                 )
 
             if self.need_mamba_block_aligned_split:
@@ -564,7 +575,9 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=(
+                            self.num_lookahead_tokens if spec_decode_enabled else 0
+                        ),
                     )
 
                     if new_blocks is not None:
@@ -620,7 +633,7 @@ class Scheduler(SchedulerInterface):
             req_index += 1
 
             # Speculative decode related.
-            if request.spec_token_ids:
+            if request.spec_token_ids and spec_decode_enabled:
                 num_scheduled_spec_tokens = (
                     num_new_tokens
                     + request.num_computed_tokens
@@ -678,6 +691,8 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                if not spec_decode_enabled and request.spec_token_ids:
+                    request.spec_token_ids = []
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -844,7 +859,11 @@ class Scheduler(SchedulerInterface):
                     # preserve full cudagraph for this step.
                     # Not for diffusion where draft tokens can't be padded.
                     if (
-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        (
+                            spec_decode_enabled
+                            and self.num_spec_tokens > 0
+                            and self.dynamic_sd_lookup is None
+                        )
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
                         and (scheduled_running_reqs and not prefill_scheduled)
@@ -887,7 +906,9 @@ class Scheduler(SchedulerInterface):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
+                            shift_computed_tokens=(
+                                1 if self.use_eagle and spec_decode_enabled else 0
+                            ),
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
@@ -900,6 +921,7 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens,
                         num_new_local_computed_tokens,
                         num_external_computed_tokens,
+                        spec_decode_enabled=spec_decode_enabled,
                     )
                     if num_new_tokens == 0:
                         break
@@ -909,7 +931,9 @@ class Scheduler(SchedulerInterface):
                 # mismatching local and remote block counts.
                 limit_lookahead_tokens = load_kv_async and self.num_lookahead_tokens > 0
                 effective_lookahead_tokens = (
-                    0 if limit_lookahead_tokens else self.num_lookahead_tokens
+                    0
+                    if limit_lookahead_tokens or not spec_decode_enabled
+                    else self.num_lookahead_tokens
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
@@ -1029,7 +1053,7 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
-                if pad_spec_decode:
+                if pad_spec_decode and spec_decode_enabled:
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
                     ] * self.num_spec_tokens
@@ -1130,8 +1154,12 @@ class Scheduler(SchedulerInterface):
         pending_kv_cache_block_copies = kv_cache_block_copies or None
 
         # Dynamic speculative decoding: compute optimal K
-        num_spec_tokens_to_schedule = self.num_spec_tokens
-        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
+        num_spec_tokens_to_schedule = self.num_spec_tokens if spec_decode_enabled else 0
+        if (
+            spec_decode_enabled
+            and self.dynamic_sd_lookup is not None
+            and len(num_scheduled_tokens) > 0
+        ):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
@@ -1164,6 +1192,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            spec_decode_enabled=spec_decode_enabled,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -2055,6 +2084,8 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+        if not self.enable_sd:
+            return
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -2079,6 +2110,8 @@ class Scheduler(SchedulerInterface):
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
     ) -> None:
+        if not scheduler_output.spec_decode_enabled:
+            return
         num_invalid_spec_tokens: dict[str, int] = {}
 
         sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens

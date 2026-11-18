@@ -1553,7 +1553,11 @@ class GPUModelRunner(
         each sequence, and a shifting is done during the next iteration
         based on the number of accepted tokens.
         """
-        if not self.speculative_config or not self.model_config.is_hybrid:
+        if (
+            not scheduler_output.spec_decode_enabled
+            or not self.speculative_config
+            or not self.model_config.is_hybrid
+        ):
             return
 
         # Count the number of accepted tokens for each sequence.
@@ -2206,7 +2210,10 @@ class GPUModelRunner(
             target = self.mrope_positions if self.uses_mrope else self.xdrope_positions
             target.gpu[:, :total_num_scheduled_tokens] += drift
 
-        use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        use_spec_decode = (
+            scheduler_output.spec_decode_enabled
+            and len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        )
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
             # partial requests. While we should not sample any token
@@ -4305,7 +4312,10 @@ class GPUModelRunner(
                         self.mamba_state_idx,
                     )
 
-            use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+            use_spec_decode = (
+                scheduler_output.spec_decode_enabled
+                and len(scheduler_output.scheduled_spec_decode_tokens) > 0
+            )
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
@@ -4365,7 +4375,10 @@ class GPUModelRunner(
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
-        defer_kv_connector_finalize = self.speculative_config is not None
+        defer_kv_connector_finalize = (
+            scheduler_output.spec_decode_enabled
+            and self.speculative_config is not None
+        )
         # Update the EPLB meta.
         if self.eplb_state is not None:
             self.eplb_state.prepare_forward(
@@ -4568,7 +4581,9 @@ class GPUModelRunner(
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
-        spec_config = self.speculative_config
+        spec_config = (
+            self.speculative_config if scheduler_output.spec_decode_enabled else None
+        )
         draft_after_bookkeeping = False
         if spec_config is not None:
             # Decide whether to run the drafter or zero out draft tokens.

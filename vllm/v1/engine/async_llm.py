@@ -796,6 +796,12 @@ class AsyncLLM(EngineClient):
         """Resume generation after :meth:`pause_generation`."""
         await self.engine_core.resume_scheduler_async()
 
+    async def toggle_speculative_decoding(self, enable: bool) -> bool:
+        """Toggle speculative decoding for future scheduler iterations."""
+        return await self.engine_core.call_utility_async(
+            "toggle_speculative_decoding", enable
+        )
+
     async def is_paused(self) -> bool:
         """Return whether the engine is currently paused."""
         return await self.engine_core.is_scheduler_paused_async()

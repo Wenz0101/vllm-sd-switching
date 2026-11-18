@@ -224,6 +224,7 @@ class EngineCore:
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
+        self._last_scheduler_output: SchedulerOutput | None = None
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
@@ -582,6 +583,7 @@ class EngineCore:
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
+        self._last_scheduler_output = None
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
@@ -601,6 +603,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._last_scheduler_output = scheduler_output
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -609,7 +612,14 @@ class EngineCore:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
+        scheduler_output = self._last_scheduler_output
+        if (
+            self.check_for_draft_tokens
+            and not self.async_scheduling
+            and model_executed
+            and scheduler_output is not None
+            and scheduler_output.spec_decode_enabled
+        ):
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
@@ -638,6 +648,8 @@ class EngineCore:
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
+
+        self._last_scheduler_output = None
 
         model_executed = False
         deferred_scheduler_output = None
@@ -703,6 +715,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._last_scheduler_output = scheduler_output
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
@@ -711,7 +724,7 @@ class EngineCore:
         if deferred_scheduler_output:
             # When draft tokens are used with structured output, validate them
             # before computing the grammar bitmask for the deferred request.
-            if self.check_for_draft_tokens:
+            if deferred_scheduler_output.scheduled_spec_decode_tokens:
                 draft_token_ids = self.model_executor.take_draft_token_ids()
                 if draft_token_ids is not None:
                     # Update the draft token ids in the scheduler output to
@@ -729,6 +742,15 @@ class EngineCore:
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
+
+    def toggle_speculative_decoding(self, enable: bool) -> bool:
+        """Set speculative decoding for future scheduler iterations."""
+        if not self.scheduler.vllm_config.speculative_config:
+            logger.warning("Speculative decoding is not configured; ignoring toggle.")
+            return False
+        self.scheduler.enable_sd = enable
+        logger.info("Speculative decoding enabled for future iterations: %s", enable)
+        return True
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():

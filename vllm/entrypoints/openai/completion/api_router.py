@@ -6,6 +6,7 @@ from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionRequest,
@@ -25,6 +26,10 @@ logger = init_logger(__name__)
 
 router = APIRouter()
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
+
+
+class ToggleSpeculativeRequest(BaseModel):
+    enabled: bool
 
 
 def completion(request: Request) -> OpenAIServingCompletion | None:
@@ -64,6 +69,18 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         )
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+@router.post("/v1/engine/speculative_decoding")
+async def toggle_speculative_decoding(
+    request: ToggleSpeculativeRequest, raw_request: Request
+):
+    engine_client = raw_request.app.state.engine_client
+    applied = await engine_client.toggle_speculative_decoding(request.enabled)
+    return {
+        "status": "success" if applied else "ignored",
+        "speculative_decoding_enabled": request.enabled,
+    }
 
 
 def attach_router(app: FastAPI):
