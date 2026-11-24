@@ -1383,6 +1383,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            spec_decode_enabled=scheduler_output.spec_decode_enabled,
         )
 
         if not self.is_last_pp_rank:
@@ -1405,6 +1406,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        spec_decode_enabled = self.execute_model_state.spec_decode_enabled
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1472,7 +1474,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
-        if self.speculator is not None and self.speculator.supports_mm_inputs:
+        if (
+            spec_decode_enabled
+            and self.speculator is not None
+            and self.speculator.supports_mm_inputs
+        ):
             # Get cached multimodal embeddings for draft forward.
             # NOTE: This is done here because postprocess updates
             # num_computed_prefill_tokens.
@@ -1494,7 +1500,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
-        if self.speculator is not None:
+        if self.speculator is not None and spec_decode_enabled:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
@@ -1519,8 +1525,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+        elif self.speculator is not None:
+            # Do not retain tokens from the previous speculative step. If SD is
+            # re-enabled later, the scheduler must receive freshly proposed
+            # tokens from that enabled iteration.
+            self.draft_tokens_handler.clear()
 
-        if self.num_speculative_steps > 0:
+        if self.num_speculative_steps > 0 and (
+            spec_decode_enabled or self.speculator is None
+        ):
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(
@@ -1647,6 +1660,7 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    spec_decode_enabled: bool
 
 
 def sort_batch_req_ids(

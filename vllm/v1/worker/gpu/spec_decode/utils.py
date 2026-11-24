@@ -19,6 +19,12 @@ class DraftTokensHandler:
         self.draft_tokens_np: np.ndarray | None = None
         self.num_draft_tokens: int = 0
 
+    def clear(self) -> None:
+        """Discard any draft-token output left from a previous step."""
+        self.req_ids = []
+        self.draft_tokens_np = None
+        self.num_draft_tokens = 0
+
     def set_draft_tokens(
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
     ) -> None:
